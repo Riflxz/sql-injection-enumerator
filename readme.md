@@ -50,7 +50,7 @@ Installation Steps
 
 ```bash
 # Clone or download the script
-git clone [repository-url]
+git clone https://github.com/Riflxz/sql-injection-enumerator
 cd sql-injection-enumerator
 
 # Install required dependencies
